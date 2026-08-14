@@ -6,7 +6,11 @@ from collections import namedtuple
 from itertools import chain
 
 from typing import List
-from metaflow.exception import MetaflowInternalError, MetaflowTaggingError
+from metaflow.exception import (
+    MetaflowException,
+    MetaflowInternalError,
+    MetaflowTaggingError,
+)
 from metaflow.tagging_util import validate_tag
 from metaflow.util import get_username, resolve_identity_as_tuple, is_stringish
 
@@ -438,6 +442,33 @@ class MetadataProvider(object):
         return MetadataProvider._reconstruct_metadata_for_attempt(
             pre_filter, attempt_int
         )
+
+    @classmethod
+    def iter_objects(cls, obj_type, sub_type, filters, attempt, *args, **kwargs):
+        """Iterate over a collection returned by ``get_object``.
+
+        Providers can override this method to stream records without materializing the
+        complete collection. ``query_filters`` and ``page_size`` are optional provider
+        hints; the default implementation supports only unfiltered iteration.
+        """
+        query_filters = kwargs.pop("query_filters", None)
+        page_size = kwargs.pop("page_size", None)
+        if kwargs:
+            raise TypeError("Unexpected iterator options: %s" % ", ".join(kwargs))
+        if query_filters:
+            raise MetaflowException(
+                "Server-side metadata filters are not supported by the %s provider"
+                % cls.TYPE
+            )
+        if page_size is not None:
+            if isinstance(page_size, bool) or not isinstance(page_size, int):
+                raise TypeError("page_size must be an integer")
+            if page_size <= 0:
+                raise ValueError("page_size must be positive")
+
+        objects = cls.get_object(obj_type, sub_type, filters, attempt, *args)
+        for obj in objects or []:
+            yield obj
 
     @classmethod
     def mutate_user_tags_for_run(

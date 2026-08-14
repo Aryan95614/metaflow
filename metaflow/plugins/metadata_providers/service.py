@@ -12,7 +12,12 @@ from metaflow.exception import (
 )
 from metaflow.metadata_provider import MetadataProvider
 from metaflow.metadata_provider.heartbeat import HB_URL_KEY
-from metaflow.metaflow_config import SERVICE_HEADERS, SERVICE_RETRY_COUNT, SERVICE_URL
+from metaflow.metaflow_config import (
+    SERVICE_HEADERS,
+    SERVICE_PAGE_SIZE,
+    SERVICE_RETRY_COUNT,
+    SERVICE_URL,
+)
 from metaflow.sidecar import Message, MessageTypes, Sidecar
 from urllib.parse import urlencode
 from metaflow.util import version_parse
@@ -55,6 +60,8 @@ class ServiceMetadataProvider(MetadataProvider):
 
     _supports_attempt_gets = None
     _supports_tag_mutation = None
+
+    _NEXT_CURSOR_HEADER = "X-Next-Cursor"
 
     def __init__(self, environment, flow, event_logger, monitor):
         super(ServiceMetadataProvider, self).__init__(
@@ -304,6 +311,79 @@ class ServiceMetadataProvider(MetadataProvider):
                 return None
             raise
 
+    @classmethod
+    def iter_objects(cls, obj_type, sub_type, filters, attempt, *args, **kwargs):
+        """Stream run listings using the service's cursor pagination API."""
+        query_filters = kwargs.pop("query_filters", None) or {}
+        page_size = kwargs.pop("page_size", None)
+        if kwargs:
+            raise TypeError("Unexpected iterator options: %s" % ", ".join(kwargs))
+
+        if (obj_type, sub_type) != ("flow", "run"):
+            for obj in super(ServiceMetadataProvider, cls).iter_objects(
+                obj_type,
+                sub_type,
+                filters,
+                attempt,
+                *args,
+                query_filters=query_filters,
+                page_size=page_size,
+            ):
+                yield obj
+            return
+        if attempt is not None:
+            raise ValueError("Run listings do not support attempts")
+        if not args:
+            raise MetaflowInternalError("A flow name is required to list runs")
+
+        page_size = SERVICE_PAGE_SIZE if page_size is None else page_size
+        if isinstance(page_size, bool) or not isinstance(page_size, int):
+            raise TypeError("page_size must be an integer")
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
+
+        query = {}
+        for key, value in query_filters.items():
+            key = str(key)
+            if key in ("_cursor", "_limit"):
+                raise ValueError("%s is controlled by the client" % key)
+            if isinstance(value, (list, tuple, set, frozenset)):
+                value = ",".join(str(v) for v in value)
+            else:
+                value = str(value)
+            query[key] = value
+
+        tag_filters = []
+        for value in (filters or {}).values():
+            if isinstance(value, (list, tuple, set, frozenset)):
+                tag_filters.extend(str(v) for v in value)
+            else:
+                tag_filters.append(str(value))
+        if tag_filters:
+            current_tags = query.get("_tags:all")
+            if current_tags:
+                tag_filters.insert(0, current_tags)
+            query["_tags:all"] = ",".join(tag_filters)
+
+        path = "%s/runs" % cls._obj_path(*args[:1])
+        cursor = None
+        seen_cursors = set()
+        while True:
+            page_query = dict(query)
+            page_query["_limit"] = page_size
+            if cursor is not None:
+                page_query["_cursor"] = cursor
+            page_path = "%s?%s" % (path, urlencode(page_query, doseq=True))
+            records, headers = cls._request(None, page_path, "GET", return_headers=True)
+            for record in MetadataProvider._apply_filter(records, filters):
+                yield record
+
+            next_cursor = headers.get(cls._NEXT_CURSOR_HEADER)
+            if not next_cursor or next_cursor in seen_cursors:
+                return
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
     def _new_run(self, run_id=None, tags=None, sys_tags=None):
         # first ensure that the flow exists
         self._get_or_create("flow")
@@ -472,6 +552,7 @@ class ServiceMetadataProvider(MetadataProvider):
         data=None,
         retry_409_path=None,
         return_raw_resp=False,
+        return_headers=False,
     ):
         if cls.INFO is None:
             raise MetaflowException(
@@ -530,7 +611,10 @@ class ServiceMetadataProvider(MetadataProvider):
                 if return_raw_resp:
                     return resp, True
                 if resp.status_code < 300:
-                    return resp.json(), True
+                    body = resp.json()
+                    if return_headers:
+                        return body, resp.headers
+                    return body, True
                 elif resp.status_code == 409 and data is not None:
                     # a special case: the post fails due to a conflict
                     # this could occur when we missed a success response
