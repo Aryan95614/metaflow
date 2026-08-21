@@ -12,6 +12,7 @@ from metaflow.exception import (
 )
 from metaflow.metadata_provider import MetadataProvider
 from metaflow.metadata_provider.heartbeat import HB_URL_KEY
+from metaflow.metadata_provider.metadata import ObjectOrder
 from metaflow.metaflow_config import (
     SERVICE_HEADERS,
     SERVICE_PAGE_SIZE,
@@ -60,8 +61,11 @@ class ServiceMetadataProvider(MetadataProvider):
 
     _supports_attempt_gets = None
     _supports_tag_mutation = None
+    _supports_cursor_pagination = None
 
     _NEXT_CURSOR_HEADER = "X-Next-Cursor"
+    _LIMIT_HEADER = "X-Limit"
+    _MIN_SERVICE_VERSION_WITH_CURSOR_PAGINATION = "2.5.1"
 
     def __init__(self, environment, flow, event_logger, monitor):
         super(ServiceMetadataProvider, self).__init__(
@@ -260,6 +264,147 @@ class ServiceMetadataProvider(MetadataProvider):
             tries += 1
 
     @classmethod
+    def _service_supports_cursor_pagination(cls):
+        if cls._supports_cursor_pagination is None:
+            version = cls._version(None)
+            cls._supports_cursor_pagination = version is not None and version_parse(
+                version
+            ) >= version_parse(cls._MIN_SERVICE_VERSION_WITH_CURSOR_PAGINATION)
+        return cls._supports_cursor_pagination
+
+    @staticmethod
+    def _header_value(headers, name):
+        if not headers:
+            return None
+        value = headers.get(name)
+        if value is not None:
+            return value
+        for key, val in headers.items():
+            if str(key).lower() == name.lower():
+                return val
+        return None
+
+    @classmethod
+    def _collection_path(cls, obj_type, obj_order, sub_type, attempt, *args):
+        if obj_type != "root":
+            url = cls._obj_path(*args[:obj_order])
+        else:
+            url = ""
+        if sub_type == "metadata":
+            url += "/metadata"
+        elif sub_type == "artifact" and obj_type == "task" and attempt is not None:
+            url += "/attempt/%s/artifacts" % attempt
+        else:
+            url += "/%ss" % sub_type
+        return url
+
+    @classmethod
+    def _can_paginate_collection(cls, sub_type, attempt):
+        return sub_type != "self" and attempt is None
+
+    @classmethod
+    def _listing_query(cls, query_filters, filters, page_size, cursor):
+        query = {}
+        for key, value in (query_filters or {}).items():
+            key = str(key)
+            if key in ("_cursor", "_limit"):
+                raise ValueError("%s is controlled by the client" % key)
+            if isinstance(value, (list, tuple, set, frozenset)):
+                value = ",".join(str(v) for v in value)
+            else:
+                value = str(value)
+            query[key] = value
+
+        tag_filters = []
+        for value in (filters or {}).values():
+            if isinstance(value, (list, tuple, set, frozenset)):
+                tag_filters.extend(str(v) for v in value)
+            else:
+                tag_filters.append(str(value))
+        if tag_filters:
+            current_tags = query.get("_tags:all")
+            if current_tags:
+                tag_filters.insert(0, current_tags)
+            query["_tags:all"] = ",".join(tag_filters)
+
+        query["_limit"] = page_size
+        if cursor is not None:
+            query["_cursor"] = cursor
+        return query
+
+    @classmethod
+    def _legacy_get_collection(
+        cls, obj_type, obj_order, sub_type, filters, attempt, *args
+    ):
+        url = cls._collection_path(obj_type, obj_order, sub_type, attempt, *args)
+        try:
+            v, _ = cls._request(None, url, "GET")
+            return MetadataProvider._apply_filter(v, filters)
+        except ServiceException as ex:
+            if ex.http_code == 404:
+                return None
+            raise
+
+    @classmethod
+    def _iter_paginated_records(
+        cls,
+        obj_type,
+        obj_order,
+        sub_type,
+        filters,
+        attempt,
+        *args,
+        query_filters=None,
+        page_size=None,
+    ):
+        page_size = SERVICE_PAGE_SIZE if page_size is None else page_size
+        if isinstance(page_size, bool) or not isinstance(page_size, int):
+            raise TypeError("page_size must be an integer")
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
+
+        path = cls._collection_path(obj_type, obj_order, sub_type, attempt, *args)
+        cursor = None
+        seen_cursors = set()
+        first_page = True
+        query_filters = query_filters or {}
+        while True:
+            page_query = cls._listing_query(query_filters, filters, page_size, cursor)
+            page_path = "%s?%s" % (path, urlencode(page_query, doseq=True))
+            try:
+                records, headers = cls._request(
+                    None, page_path, "GET", return_headers=True
+                )
+            except ServiceException as ex:
+                if ex.http_code == 404:
+                    return
+                raise
+            if first_page:
+                first_page = False
+                if cls._header_value(headers, cls._LIMIT_HEADER) is None:
+                    if query_filters:
+                        raise ServiceException(
+                            "Filtering requires a metadata service with pagination "
+                            "and filtering support (at least version %s). Please "
+                            "upgrade your service."
+                            % cls._MIN_SERVICE_VERSION_WITH_CURSOR_PAGINATION
+                        )
+                    legacy = cls._legacy_get_collection(
+                        obj_type, obj_order, sub_type, filters, attempt, *args
+                    )
+                    for record in legacy or []:
+                        yield record
+                    return
+            for record in MetadataProvider._apply_filter(records, filters):
+                yield record
+
+            next_cursor = cls._header_value(headers, cls._NEXT_CURSOR_HEADER)
+            if not next_cursor or next_cursor in seen_cursors:
+                return
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
+    @classmethod
     def _get_object_internal(
         cls, obj_type, obj_order, sub_type, sub_order, filters, attempt, *args
     ):
@@ -292,34 +437,50 @@ class ServiceMetadataProvider(MetadataProvider):
                     return None
                 raise
 
-        # For the other types, we locate all the objects we need to find and return them
-        if obj_type != "root":
-            url = ServiceMetadataProvider._obj_path(*args[:obj_order])
-        else:
-            url = ""
-        if sub_type == "metadata":
-            url += "/metadata"
-        elif sub_type == "artifact" and obj_type == "task" and attempt is not None:
-            url += "/attempt/%s/artifacts" % attempt
-        else:
-            url += "/%ss" % sub_type
-        try:
-            v, _ = cls._request(None, url, "GET")
-            return MetadataProvider._apply_filter(v, filters)
-        except ServiceException as ex:
-            if ex.http_code == 404:
-                return None
-            raise
+        # Newer services can stream collections; keep returning a list here so
+        # get_object callers are unchanged. Older services stay on the bulk GET.
+        if (
+            cls._can_paginate_collection(sub_type, attempt)
+            and cls._service_supports_cursor_pagination()
+        ):
+            try:
+                return list(
+                    cls._iter_paginated_records(
+                        obj_type, obj_order, sub_type, filters, attempt, *args
+                    )
+                )
+            except ServiceException as ex:
+                if ex.http_code == 404:
+                    return None
+                raise
+
+        return cls._legacy_get_collection(
+            obj_type, obj_order, sub_type, filters, attempt, *args
+        )
 
     @classmethod
     def iter_objects(cls, obj_type, sub_type, filters, attempt, *args, **kwargs):
-        """Stream run listings using the service's cursor pagination API."""
+        """Stream collection listings using cursor pagination when the service supports it."""
         query_filters = kwargs.pop("query_filters", None) or {}
         page_size = kwargs.pop("page_size", None)
         if kwargs:
             raise TypeError("Unexpected iterator options: %s" % ", ".join(kwargs))
 
-        if (obj_type, sub_type) != ("flow", "run"):
+        if not cls._service_supports_cursor_pagination():
+            if query_filters:
+                raise ServiceException(
+                    "Filtering requires a metadata service with pagination "
+                    "and filtering support (at least version %s). Please "
+                    "upgrade your service."
+                    % cls._MIN_SERVICE_VERSION_WITH_CURSOR_PAGINATION
+                )
+            for obj in super(ServiceMetadataProvider, cls).iter_objects(
+                obj_type, sub_type, filters, attempt, *args, page_size=page_size
+            ):
+                yield obj
+            return
+
+        if not cls._can_paginate_collection(sub_type, attempt):
             for obj in super(ServiceMetadataProvider, cls).iter_objects(
                 obj_type,
                 sub_type,
@@ -331,58 +492,21 @@ class ServiceMetadataProvider(MetadataProvider):
             ):
                 yield obj
             return
-        if attempt is not None:
-            raise ValueError("Run listings do not support attempts")
-        if not args:
-            raise MetaflowInternalError("A flow name is required to list runs")
 
-        page_size = SERVICE_PAGE_SIZE if page_size is None else page_size
-        if isinstance(page_size, bool) or not isinstance(page_size, int):
-            raise TypeError("page_size must be an integer")
-        if page_size <= 0:
-            raise ValueError("page_size must be positive")
-
-        query = {}
-        for key, value in query_filters.items():
-            key = str(key)
-            if key in ("_cursor", "_limit"):
-                raise ValueError("%s is controlled by the client" % key)
-            if isinstance(value, (list, tuple, set, frozenset)):
-                value = ",".join(str(v) for v in value)
-            else:
-                value = str(value)
-            query[key] = value
-
-        tag_filters = []
-        for value in (filters or {}).values():
-            if isinstance(value, (list, tuple, set, frozenset)):
-                tag_filters.extend(str(v) for v in value)
-            else:
-                tag_filters.append(str(value))
-        if tag_filters:
-            current_tags = query.get("_tags:all")
-            if current_tags:
-                tag_filters.insert(0, current_tags)
-            query["_tags:all"] = ",".join(tag_filters)
-
-        path = "%s/runs" % cls._obj_path(*args[:1])
-        cursor = None
-        seen_cursors = set()
-        while True:
-            page_query = dict(query)
-            page_query["_limit"] = page_size
-            if cursor is not None:
-                page_query["_cursor"] = cursor
-            page_path = "%s?%s" % (path, urlencode(page_query, doseq=True))
-            records, headers = cls._request(None, page_path, "GET", return_headers=True)
-            for record in MetadataProvider._apply_filter(records, filters):
-                yield record
-
-            next_cursor = headers.get(cls._NEXT_CURSOR_HEADER)
-            if not next_cursor or next_cursor in seen_cursors:
-                return
-            seen_cursors.add(next_cursor)
-            cursor = next_cursor
+        obj_order = ObjectOrder.type_to_order(obj_type)
+        if obj_order is None:
+            raise MetaflowInternalError("Cannot find type %s" % obj_type)
+        for obj in cls._iter_paginated_records(
+            obj_type,
+            obj_order,
+            sub_type,
+            filters,
+            attempt,
+            *args,
+            query_filters=query_filters,
+            page_size=page_size,
+        ):
+            yield obj
 
     def _new_run(self, run_id=None, tags=None, sys_tags=None):
         # first ensure that the flow exists

@@ -467,7 +467,14 @@ class MetadataProvider(object):
                 raise ValueError("page_size must be positive")
 
         objects = cls.get_object(obj_type, sub_type, filters, attempt, *args)
-        for obj in objects or []:
+        if isinstance(objects, dict):
+            objects = [objects]
+        objects = sorted(
+            objects or [],
+            key=lambda obj: obj.get("ts_epoch") or 0,
+            reverse=True,
+        )
+        for obj in objects:
             yield obj
 
     @classmethod

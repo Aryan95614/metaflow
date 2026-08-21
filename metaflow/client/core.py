@@ -2616,7 +2616,13 @@ class Flow(MetaflowObject):
             if run.successful:
                 return run
 
-    def runs(self, *tags: str, **kwargs) -> Iterator[Run]:
+    def runs(
+        self,
+        *tags: str,
+        filters: Optional[Dict[str, Any]] = None,
+        page_size: Optional[int] = None,
+        max_runs: Optional[int] = None,
+    ) -> Iterator[Run]:
         """
         Returns an iterator over all `Run`s of this flow.
 
@@ -2627,25 +2633,22 @@ class Flow(MetaflowObject):
         Parameters
         ----------
         tags : str
-            Tags to match.
+            Tags to match. Applied locally after listing, so this works with
+            local metadata as well as the metadata service.
         filters : dict, optional
             Server-side run filters using the metadata service's ``field:operator``
-            grammar, for example ``{"status:eq": "failed"}``.
+            grammar, for example ``{"status:eq": "failed"}``. Requires a metadata
+            service with pagination and filtering support.
         page_size : int, optional
             Number of records requested from the metadata service per page.
         max_runs : int, optional
-            Maximum number of runs to yield.
+            Maximum number of runs to yield, newest first.
 
         Yields
         ------
         Run
             `Run` objects in this flow.
         """
-        filters = kwargs.pop("filters", None)
-        page_size = kwargs.pop("page_size", None)
-        max_runs = kwargs.pop("max_runs", None)
-        if kwargs:
-            raise TypeError("Unexpected Flow.runs options: %s" % ", ".join(kwargs))
         if filters is not None and not hasattr(filters, "items"):
             raise TypeError("filters must be a mapping")
         if max_runs is not None:
@@ -2659,16 +2662,8 @@ class Flow(MetaflowObject):
         if filters is None and page_size is None and max_runs is None:
             return self._filtered_children(*tags)
 
-        query_filters = dict(filters or {})
-        server_tags = list(tags)
-        if server_tags:
-            existing = query_filters.get("_tags:all")
-            if existing:
-                server_tags.insert(0, str(existing))
-            query_filters["_tags:all"] = ",".join(server_tags)
-
         runs = self._iter_children(
-            query_filters=query_filters,
+            query_filters=dict(filters) if filters else None,
             page_size=page_size,
             required_tags=tags,
         )
