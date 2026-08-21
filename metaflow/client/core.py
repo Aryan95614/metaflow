@@ -7,7 +7,7 @@ from collections import namedtuple
 from datetime import datetime
 from tempfile import TemporaryDirectory
 from io import BytesIO
-from itertools import chain
+from itertools import chain, islice
 from typing import (
     Any,
     Dict,
@@ -433,6 +433,37 @@ class MetaflowObject(object):
         """
         for child in self:
             if all(tag in child.tags for tag in tags):
+                yield child
+
+    def _iter_children(self, query_filters=None, page_size=None, required_tags=()):
+        """Stream child records through the active metadata provider."""
+        namespace_filter = {}
+        if self._namespace_check and self._current_namespace:
+            namespace_filter = {"any_tags": self._current_namespace}
+
+        objects = self._metaflow.metadata.iter_objects(
+            self._NAME,
+            _CLASSES[self._CHILD_CLASS]._NAME,
+            namespace_filter,
+            self._attempt,
+            *self.path_components,
+            query_filters=query_filters,
+            page_size=page_size,
+        )
+        for obj in objects:
+            child = _CLASSES[self._CHILD_CLASS](
+                attempt=self._attempt,
+                _object=obj,
+                _parent=self,
+                _metaflow=self._metaflow,
+                _namespace_check=self._namespace_check,
+                _current_namespace=(
+                    self._current_namespace if self._namespace_check else None
+                ),
+            )
+            if self._iter_filter(child) and all(
+                tag in child.tags for tag in required_tags
+            ):
                 yield child
 
     def _ipython_key_completions_(self):
@@ -2585,7 +2616,13 @@ class Flow(MetaflowObject):
             if run.successful:
                 return run
 
-    def runs(self, *tags: str) -> Iterator[Run]:
+    def runs(
+        self,
+        *tags: str,
+        filters: Optional[Dict[str, Any]] = None,
+        page_size: Optional[int] = None,
+        max_runs: Optional[int] = None,
+    ) -> Iterator[Run]:
         """
         Returns an iterator over all `Run`s of this flow.
 
@@ -2596,14 +2633,43 @@ class Flow(MetaflowObject):
         Parameters
         ----------
         tags : str
-            Tags to match.
+            Tags to match. Applied locally after listing, so this works with
+            local metadata as well as the metadata service.
+        filters : dict, optional
+            Server-side run filters using the metadata service's ``field:operator``
+            grammar, for example ``{"status:eq": "failed"}``. Requires a metadata
+            service with pagination and filtering support.
+        page_size : int, optional
+            Number of records requested from the metadata service per page.
+        max_runs : int, optional
+            Maximum number of runs to yield, newest first.
 
         Yields
         ------
         Run
             `Run` objects in this flow.
         """
-        return self._filtered_children(*tags)
+        if filters is not None and not hasattr(filters, "items"):
+            raise TypeError("filters must be a mapping")
+        if max_runs is not None:
+            if isinstance(max_runs, bool) or not isinstance(max_runs, int):
+                raise TypeError("max_runs must be an integer")
+            if max_runs < 0:
+                raise ValueError("max_runs must be non-negative")
+            if max_runs == 0:
+                return iter(())
+
+        if filters is None and page_size is None and max_runs is None:
+            return self._filtered_children(*tags)
+
+        runs = self._iter_children(
+            query_filters=dict(filters) if filters else None,
+            page_size=page_size,
+            required_tags=tags,
+        )
+        if max_runs is None:
+            return runs
+        return islice(runs, max_runs)
 
     def __iter__(self) -> Iterator[Task]:
         """
