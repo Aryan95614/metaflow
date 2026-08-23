@@ -2413,13 +2413,13 @@ class Run(MetaflowObject):
     @property
     def failed_task(self) -> Optional[Task]:
         """
-        Returns the first failed (unsuccessful) task in this run, if any.
+        Returns the latest failed (unsuccessful) task in this run, if any.
 
         Steps and their tasks are scanned in iteration order, which is
-        newest-created first (see `MetaflowObject.__iter__`). The first task
-        whose `successful` is False is returned; for a failed run this is
-        typically the task that caused the failure. Returns None when every
-        task in the run is successful.
+        newest-created first (see `MetaflowObject.__iter__`), so the first
+        match is the latest failed task; for a failed run this is typically
+        the task that caused the failure. Returns None when every task in
+        the run is successful.
 
         Together with `Flow.failed_runs` and `Task.failure_summary` this lets
         you investigate failures through the regular client:
@@ -2435,7 +2435,7 @@ class Run(MetaflowObject):
         Returns
         -------
         Task, optional
-            The first unsuccessful task, or None if the run has none.
+            The latest unsuccessful task, or None if the run has none.
         """
         for step in self:
             for task in step:
