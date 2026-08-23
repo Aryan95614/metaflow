@@ -4,7 +4,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from metaflow.client.core import Flow
-from metaflow.exception import MetaflowException
+from metaflow.exception import MetaflowException, MetaflowInternalError
 from metaflow.plugins.metadata_providers.local import LocalMetadataProvider
 from metaflow.plugins.metadata_providers.service import (
     ServiceException,
@@ -382,3 +382,133 @@ def test_flow_runs_zero_limit_avoids_starting_iterator():
     flow._iter_children.side_effect = AssertionError("iterator should not be started")
 
     assert list(Flow.runs.__get__(flow, Flow)(max_runs=0)) == []
+
+
+def test_get_object_internal_returns_none_not_empty_on_404(monkeypatch):
+    """A missing (404) collection must return None like the legacy path, not [].
+
+    The paginated iterator swallows a first-page 404, so without care
+    list(...) would yield [] and mask "not found" as "empty".
+    """
+    monkeypatch.setattr(
+        ServiceMetadataProvider, "_version", classmethod(_paginating_version)
+    )
+
+    def fake_request(cls, monitor, path, method, **kwargs):
+        raise ServiceException("collection not found", http_code=404)
+
+    monkeypatch.setattr(ServiceMetadataProvider, "_request", classmethod(fake_request))
+
+    result = ServiceMetadataProvider._get_object_internal(
+        "flow", 1, "run", 2, None, None, "ExampleFlow"
+    )
+    assert result is None
+
+
+def test_iter_objects_yields_empty_on_404(monkeypatch):
+    """Streaming a missing collection yields nothing (no 404 leaking to callers)."""
+    monkeypatch.setattr(
+        ServiceMetadataProvider, "_version", classmethod(_paginating_version)
+    )
+
+    def fake_request(cls, monitor, path, method, **kwargs):
+        raise ServiceException("collection not found", http_code=404)
+
+    monkeypatch.setattr(ServiceMetadataProvider, "_request", classmethod(fake_request))
+
+    assert (
+        list(
+            ServiceMetadataProvider.iter_objects(
+                "flow", "run", None, None, "ExampleFlow"
+            )
+        )
+        == []
+    )
+
+
+def test_get_object_internal_mid_page_404_returns_none(monkeypatch):
+    """get_object keeps legacy's atomic contract: a 404 at ANY point in the
+    listing resolves to None, never a silently truncated partial list."""
+    monkeypatch.setattr(
+        ServiceMetadataProvider, "_version", classmethod(_paginating_version)
+    )
+    calls = []
+
+    def fake_request(cls, monitor, path, method, **kwargs):
+        calls.append(path)
+        if len(calls) == 1:
+            return [_record(2)], {"X-Next-Cursor": "p2", "X-Limit": "1"}
+        raise ServiceException("collection deleted mid-scan", http_code=404)
+
+    monkeypatch.setattr(ServiceMetadataProvider, "_request", classmethod(fake_request))
+
+    result = ServiceMetadataProvider._get_object_internal(
+        "flow", 1, "run", 2, None, None, "ExampleFlow"
+    )
+    assert result is None
+    assert len(calls) == 2
+
+
+def test_iter_objects_mid_page_404_ends_stream_with_first_page(monkeypatch):
+    """Streaming keeps what was fetched: a mid-pagination 404 just ends the
+    stream after the records already yielded."""
+    monkeypatch.setattr(
+        ServiceMetadataProvider, "_version", classmethod(_paginating_version)
+    )
+    calls = []
+
+    def fake_request(cls, monitor, path, method, **kwargs):
+        calls.append(path)
+        if len(calls) == 1:
+            return [_record(2)], {"X-Next-Cursor": "p2", "X-Limit": "1"}
+        raise ServiceException("collection deleted mid-scan", http_code=404)
+
+    monkeypatch.setattr(ServiceMetadataProvider, "_request", classmethod(fake_request))
+
+    records = list(
+        ServiceMetadataProvider.iter_objects("flow", "run", None, None, "ExampleFlow")
+    )
+    assert [record["run_number"] for record in records] == [2]
+    assert len(calls) == 2
+
+
+def test_get_object_internal_returns_none_when_legacy_fallback_404s(monkeypatch):
+    """The no-X-Limit fallback must not mask 'not found' as 'empty': if the
+    legacy GET 404s, get_object returns None, not []."""
+    monkeypatch.setattr(
+        ServiceMetadataProvider, "_version", classmethod(_paginating_version)
+    )
+    calls = []
+
+    def fake_request(cls, monitor, path, method, **kwargs):
+        calls.append(kwargs)
+        if "return_headers" in kwargs:
+            # Paginated probe: 200 but no X-Limit -> triggers legacy fallback.
+            return [_record(9)], {}
+        raise ServiceException("collection not found", http_code=404)
+
+    monkeypatch.setattr(ServiceMetadataProvider, "_request", classmethod(fake_request))
+
+    result = ServiceMetadataProvider._get_object_internal(
+        "flow", 1, "run", 2, None, None, "ExampleFlow"
+    )
+    assert result is None
+    assert len(calls) == 2
+
+
+def test_service_paginated_iterator_validates_obj_subtype(monkeypatch):
+    """The paginated path enforces the same obj/sub_type guards as get_object."""
+    monkeypatch.setattr(
+        ServiceMetadataProvider, "_version", classmethod(_paginating_version)
+    )
+
+    def unexpected_request(*args, **kwargs):
+        raise AssertionError("validation must fail before any request")
+
+    monkeypatch.setattr(
+        ServiceMetadataProvider, "_request", classmethod(unexpected_request)
+    )
+
+    # 'flow' is not slotted below 'run' -> nonsensical; must raise before any request.
+    with pytest.raises(MetaflowInternalError, match="not allowed"):
+        list(ServiceMetadataProvider.iter_objects("run", "flow", None, None, "F", "1"))

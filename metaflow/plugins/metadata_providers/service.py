@@ -12,7 +12,6 @@ from metaflow.exception import (
 )
 from metaflow.metadata_provider import MetadataProvider
 from metaflow.metadata_provider.heartbeat import HB_URL_KEY
-from metaflow.metadata_provider.metadata import ObjectOrder
 from metaflow.metaflow_config import (
     SERVICE_HEADERS,
     SERVICE_PAGE_SIZE,
@@ -65,7 +64,7 @@ class ServiceMetadataProvider(MetadataProvider):
 
     _NEXT_CURSOR_HEADER = "X-Next-Cursor"
     _LIMIT_HEADER = "X-Limit"
-    _MIN_SERVICE_VERSION_WITH_CURSOR_PAGINATION = "2.5.1"
+    _MIN_SERVICE_VERSION_WITH_CURSOR_PAGINATION = "2.6.0"
 
     def __init__(self, environment, flow, event_logger, monitor):
         super(ServiceMetadataProvider, self).__init__(
@@ -334,7 +333,14 @@ class ServiceMetadataProvider(MetadataProvider):
 
     @classmethod
     def _legacy_get_collection(
-        cls, obj_type, obj_order, sub_type, filters, attempt, *args
+        cls,
+        obj_type,
+        obj_order,
+        sub_type,
+        filters,
+        attempt,
+        *args,
+        raise_on_missing=False,
     ):
         url = cls._collection_path(obj_type, obj_order, sub_type, attempt, *args)
         try:
@@ -342,6 +348,8 @@ class ServiceMetadataProvider(MetadataProvider):
             return MetadataProvider._apply_filter(v, filters)
         except ServiceException as ex:
             if ex.http_code == 404:
+                if raise_on_missing:
+                    raise
                 return None
             raise
 
@@ -356,6 +364,7 @@ class ServiceMetadataProvider(MetadataProvider):
         *args,
         query_filters=None,
         page_size=None,
+        raise_on_missing=False,
     ):
         page_size = SERVICE_PAGE_SIZE if page_size is None else page_size
         if isinstance(page_size, bool) or not isinstance(page_size, int):
@@ -382,6 +391,14 @@ class ServiceMetadataProvider(MetadataProvider):
                 )
             except ServiceException as ex:
                 if ex.http_code == 404:
+                    # A missing collection. When the caller needs to tell "not
+                    # found" (None) apart from "empty" ([]) -- e.g. get_object --
+                    # re-raise no matter which page 404'd, so the whole listing
+                    # resolves to None and keeps legacy's atomic full-result-or-
+                    # None contract (never a silently truncated partial list).
+                    # Streaming callers instead just end the stream here.
+                    if raise_on_missing:
+                        raise
                     return
                 raise
             if first_page:
@@ -395,7 +412,13 @@ class ServiceMetadataProvider(MetadataProvider):
                             % cls._MIN_SERVICE_VERSION_WITH_CURSOR_PAGINATION
                         )
                     legacy = cls._legacy_get_collection(
-                        obj_type, obj_order, sub_type, filters, attempt, *args
+                        obj_type,
+                        obj_order,
+                        sub_type,
+                        filters,
+                        attempt,
+                        *args,
+                        raise_on_missing=raise_on_missing,
                     )
                     for record in legacy or []:
                         yield record
@@ -463,7 +486,13 @@ class ServiceMetadataProvider(MetadataProvider):
             try:
                 return list(
                     cls._iter_paginated_records(
-                        obj_type, obj_order, sub_type, filters, attempt, *args
+                        obj_type,
+                        obj_order,
+                        sub_type,
+                        filters,
+                        attempt,
+                        *args,
+                        raise_on_missing=True,
                     )
                 )
             except ServiceException as ex:
@@ -477,7 +506,11 @@ class ServiceMetadataProvider(MetadataProvider):
 
     @classmethod
     def iter_objects(cls, obj_type, sub_type, filters, attempt, *args, **kwargs):
-        """Stream collection listings using cursor pagination when the service supports it."""
+        """Stream collection listings using cursor pagination when the service supports it.
+
+        Like the base implementation, this is a generator: argument validation
+        and capability errors surface when iteration starts, not at call time.
+        """
         query_filters = kwargs.pop("query_filters", None) or {}
         page_size = kwargs.pop("page_size", None)
         if kwargs:
@@ -510,9 +543,10 @@ class ServiceMetadataProvider(MetadataProvider):
                 yield obj
             return
 
-        obj_order = ObjectOrder.type_to_order(obj_type)
-        if obj_order is None:
-            raise MetaflowInternalError("Cannot find type %s" % obj_type)
+        # Same access-validation as get_object -- the paginated path must not
+        # accept nonsensical obj_type/sub_type combinations the materialized
+        # path would reject.
+        obj_order, _ = cls._validate_object_query(obj_type, sub_type)
         for obj in cls._iter_paginated_records(
             obj_type,
             obj_order,

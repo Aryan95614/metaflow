@@ -353,6 +353,37 @@ class MetadataProvider(object):
             self.sticky_sys_tags.update(sys_tags)
 
     @classmethod
+    def _validate_object_query(cls, obj_type, sub_type):
+        """Reject nonsensical obj_type/sub_type combinations.
+
+        Shared by get_object and the streaming listing paths so every access,
+        materialized or paginated, enforces the same rules. Returns the
+        (type_order, sub_order) pair for callers that need it.
+        """
+        type_order = ObjectOrder.type_to_order(obj_type)
+        sub_order = ObjectOrder.type_to_order(sub_type)
+
+        if type_order is None:
+            raise MetaflowInternalError(msg="Cannot find type %s" % obj_type)
+        if type_order >= ObjectOrder.type_to_order("metadata"):
+            raise MetaflowInternalError(msg="Type %s is not allowed" % obj_type)
+
+        if sub_order is None:
+            raise MetaflowInternalError(msg="Cannot find subtype %s" % sub_type)
+
+        if type_order >= sub_order:
+            raise MetaflowInternalError(
+                msg="Subtype %s not allowed for %s" % (sub_type, obj_type)
+            )
+
+        # Metadata is always only at the task level
+        if sub_type == "metadata" and obj_type != "task":
+            raise MetaflowInternalError(
+                msg="Metadata can only be retrieved at the task level"
+            )
+        return type_order, sub_order
+
+    @classmethod
     def get_object(cls, obj_type, sub_type, filters, attempt, *args):
         """Returns the requested object depending on obj_type and sub_type
 
@@ -401,27 +432,7 @@ class MetadataProvider(object):
             object or list :
                 Depending on the call, the type of object return varies
         """
-        type_order = ObjectOrder.type_to_order(obj_type)
-        sub_order = ObjectOrder.type_to_order(sub_type)
-
-        if type_order is None:
-            raise MetaflowInternalError(msg="Cannot find type %s" % obj_type)
-        if type_order >= ObjectOrder.type_to_order("metadata"):
-            raise MetaflowInternalError(msg="Type %s is not allowed" % obj_type)
-
-        if sub_order is None:
-            raise MetaflowInternalError(msg="Cannot find subtype %s" % sub_type)
-
-        if type_order >= sub_order:
-            raise MetaflowInternalError(
-                msg="Subtype %s not allowed for %s" % (sub_type, obj_type)
-            )
-
-        # Metadata is always only at the task level
-        if sub_type == "metadata" and obj_type != "task":
-            raise MetaflowInternalError(
-                msg="Metadata can only be retrieved at the task level"
-            )
+        type_order, sub_order = cls._validate_object_query(obj_type, sub_type)
 
         if attempt is not None:
             try:
