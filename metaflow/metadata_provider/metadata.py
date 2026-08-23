@@ -469,6 +469,11 @@ class MetadataProvider(object):
         objects = cls.get_object(obj_type, sub_type, filters, attempt, *args)
         if isinstance(objects, dict):
             objects = [objects]
+        # Yield newest-first (descending ts_epoch). This mirrors the order the
+        # metadata service returns for paginated listings, so callers see a
+        # consistent order whether records came from the service or a legacy /
+        # local provider. ts_epoch may be missing on some records, so fall back
+        # to 0 to keep the sort total.
         objects = sorted(
             objects or [],
             key=lambda obj: obj.get("ts_epoch") or 0,

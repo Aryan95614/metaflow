@@ -368,6 +368,11 @@ class ServiceMetadataProvider(MetadataProvider):
         seen_cursors = set()
         first_page = True
         query_filters = query_filters or {}
+        # Result ordering is implicit: we send no _order query param (none exists
+        # yet), so pages arrive in the service's default order, which is
+        # newest-first (descending ts_epoch). MetadataProvider.iter_objects
+        # applies the same descending ts_epoch sort for legacy/local providers,
+        # so ordering stays consistent regardless of which path served the records.
         while True:
             page_query = cls._listing_query(query_filters, filters, page_size, cursor)
             page_path = "%s?%s" % (path, urlencode(page_query, doseq=True))
@@ -437,8 +442,20 @@ class ServiceMetadataProvider(MetadataProvider):
                     return None
                 raise
 
-        # Newer services can stream collections; keep returning a list here so
-        # get_object callers are unchanged. Older services stay on the bulk GET.
+        # Newer services can stream collections, but get_object's contract is a
+        # concrete object-or-list, so we materialize the pages here to keep every
+        # existing caller unchanged. That trades some client-side memory for
+        # backward compatibility -- the goal of pagination here is to relieve
+        # server-side pressure, not client-side. Callers that need to stream
+        # large collections without materializing should go through
+        # iter_objects() / _iter_paginated_records (e.g. Flow.runs()), which
+        # yield page by page. Older services stay on the bulk GET.
+        #
+        # Possible follow-up (left for a future contributor): let the generic
+        # get_object / MetaflowObject.__iter__ path stream for new services too,
+        # so plain iteration is also memory-bounded. That requires changing
+        # get_object's object-or-list return contract, so it is intentionally
+        # out of scope here.
         if (
             cls._can_paginate_collection(sub_type, attempt)
             and cls._service_supports_cursor_pagination()
