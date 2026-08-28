@@ -4,6 +4,7 @@ import json
 import os
 import tarfile
 from collections import namedtuple
+from collections.abc import Mapping
 from datetime import datetime
 from tempfile import TemporaryDirectory
 from io import BytesIO
@@ -401,19 +402,7 @@ class MetaflowObject(object):
         unfiltered_children = unfiltered_children if unfiltered_children else []
         children = filter(
             lambda x: self._iter_filter(x),
-            (
-                _CLASSES[self._CHILD_CLASS](
-                    attempt=self._attempt,
-                    _object=obj,
-                    _parent=self,
-                    _metaflow=self._metaflow,
-                    _namespace_check=self._namespace_check,
-                    _current_namespace=(
-                        self._current_namespace if self._namespace_check else None
-                    ),
-                )
-                for obj in unfiltered_children
-            ),
+            (self._child_from_record(obj) for obj in unfiltered_children),
         )
 
         if children:
@@ -423,6 +412,23 @@ class MetaflowObject(object):
 
     def _iter_filter(self, x):
         return True
+
+    def _child_from_record(self, obj):
+        """Build a child object from a raw metadata record.
+
+        Shared by __iter__ and _iter_children so the materialized and streaming
+        listing paths cannot drift apart.
+        """
+        return _CLASSES[self._CHILD_CLASS](
+            attempt=self._attempt,
+            _object=obj,
+            _parent=self,
+            _metaflow=self._metaflow,
+            _namespace_check=self._namespace_check,
+            _current_namespace=(
+                self._current_namespace if self._namespace_check else None
+            ),
+        )
 
     def _filtered_children(self, *tags):
         """
@@ -451,16 +457,7 @@ class MetaflowObject(object):
             page_size=page_size,
         )
         for obj in objects:
-            child = _CLASSES[self._CHILD_CLASS](
-                attempt=self._attempt,
-                _object=obj,
-                _parent=self,
-                _metaflow=self._metaflow,
-                _namespace_check=self._namespace_check,
-                _current_namespace=(
-                    self._current_namespace if self._namespace_check else None
-                ),
-            )
+            child = self._child_from_record(obj)
             if self._iter_filter(child) and all(
                 tag in child.tags for tag in required_tags
             ):
@@ -2619,8 +2616,7 @@ class Flow(MetaflowObject):
     def runs(
         self,
         *tags: str,
-        filters: Optional[Dict[str, Any]] = None,
-        page_size: Optional[int] = None,
+        _filters: Optional[Dict[str, Any]] = None,
         max_runs: Optional[int] = None,
     ) -> Iterator[Run]:
         """
@@ -2635,23 +2631,28 @@ class Flow(MetaflowObject):
         tags : str
             Tags to match. Applied locally after listing, so this works with
             local metadata as well as the metadata service.
-        filters : dict, optional
-            Server-side run filters using the metadata service's ``field:operator``
-            grammar, for example ``{"status:eq": "failed"}``. Requires a metadata
-            service with pagination and filtering support.
-        page_size : int, optional
-            Number of records requested from the metadata service per page.
+        _filters : dict, optional
+            Internal, unstable. Server-side run filters expressed in the metadata
+            service's ``field:operator`` grammar, for example
+            ``{"status:eq": "failed"}``. The grammar is specific to the metadata
+            service and has no meaning for local metadata, so it is deliberately
+            not part of the public interface -- the typed accessors built on top
+            of it are the supported way to filter. Requires a metadata service
+            with pagination and filtering support.
         max_runs : int, optional
-            Maximum number of runs to yield, newest first.
+            Maximum number of runs to yield, newest first. Supported by every
+            metadata provider.
 
         Yields
         ------
         Run
             `Run` objects in this flow.
         """
-        if filters is not None and not hasattr(filters, "items"):
-            raise TypeError("filters must be a mapping")
+        if _filters is not None and not isinstance(_filters, Mapping):
+            raise TypeError("_filters must be a mapping")
         if max_runs is not None:
+            # bool is a subclass of int, so isinstance(True, int) is True; without
+            # the explicit bool check runs(max_runs=True) would silently mean 1.
             if isinstance(max_runs, bool) or not isinstance(max_runs, int):
                 raise TypeError("max_runs must be an integer")
             if max_runs < 0:
@@ -2659,12 +2660,13 @@ class Flow(MetaflowObject):
             if max_runs == 0:
                 return iter(())
 
-        if filters is None and page_size is None and max_runs is None:
+        if _filters is None and max_runs is None:
             return self._filtered_children(*tags)
 
+        # Page size is a metadata-service transport detail, not a caller concern:
+        # this returns an iterator either way. It comes from METAFLOW_SERVICE_PAGE_SIZE.
         runs = self._iter_children(
-            query_filters=dict(filters) if filters else None,
-            page_size=page_size,
+            query_filters=dict(_filters) if _filters else None,
             required_tags=tags,
         )
         if max_runs is None:
