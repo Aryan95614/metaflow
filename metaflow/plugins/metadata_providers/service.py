@@ -67,7 +67,12 @@ class ServiceMetadataProvider(MetadataProvider):
     # The metadata service refuses a larger _limit, so ask for at most this many.
     _MAX_SERVICE_PAGE_SIZE = 500
     _LIMIT_HEADER = "X-Limit"
-    _MIN_SERVICE_VERSION_WITH_CURSOR_PAGINATION = "2.6.0"
+    # 2.6.0 introduced cursor pagination and filtering, but its paginated
+    # artifact query reduced to the newest row per artifact *name* rather than
+    # to the task's latest attempt. 2.6.1 (metaflow-service#497) fixed that, so
+    # it is the first release the paginated path can be used against for every
+    # collection, artifacts included.
+    _MIN_SERVICE_VERSION_WITH_CURSOR_PAGINATION = "2.6.1"
 
     def __init__(self, environment, flow, event_logger, monitor):
         super(ServiceMetadataProvider, self).__init__(
@@ -308,13 +313,11 @@ class ServiceMetadataProvider(MetadataProvider):
 
     @classmethod
     def _can_paginate_collection(cls, sub_type, attempt):
-        # Artifacts are excluded on purpose. The paginated artifact query on
-        # service 2.6.0 returns the newest row per artifact *name*, not the
-        # artifacts of the newest task *attempt*, so an artifact written only by
-        # attempt 0 can surface on a task whose latest attempt never wrote it.
-        # Until the service query is corrected, artifact collections always take
-        # the legacy latest-attempt path.
-        return sub_type not in ("self", "artifact") and attempt is None
+        # "self" is a single object, not a collection, and the per-attempt
+        # artifact endpoint has no cursor pagination. Everything else, artifacts
+        # included, is paginated once the service version gate passes (see
+        # _MIN_SERVICE_VERSION_WITH_CURSOR_PAGINATION).
+        return sub_type != "self" and attempt is None
 
     @classmethod
     def _listing_query(cls, query_filters, filters, page_size, cursor):

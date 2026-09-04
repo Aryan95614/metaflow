@@ -120,13 +120,19 @@ def test_service_run_iterator_follows_cursor_and_preserves_filters(monkeypatch):
             ("ExampleFlow", "12", "start", "1"),
             "/flows/ExampleFlow/runs/12/steps/start/tasks/1/metadata",
         ),
+        (
+            "task",
+            "artifact",
+            ("ExampleFlow", "12", "start", "1"),
+            "/flows/ExampleFlow/runs/12/steps/start/tasks/1/artifacts",
+        ),
     ],
-    ids=["flows", "runs", "steps", "tasks", "metadata"],
+    ids=["flows", "runs", "steps", "tasks", "metadata", "artifacts"],
 )
 def test_service_iterator_paginates_every_paginable_collection(
     obj_type, sub_type, args, expected_path, monkeypatch
 ):
-    """Every collection except artifacts goes through the paginated path."""
+    """Every collection, artifacts included, goes through the paginated path."""
     monkeypatch.setattr(
         ServiceMetadataProvider, "_version", classmethod(_paginating_version)
     )
@@ -149,17 +155,14 @@ def test_service_iterator_paginates_every_paginable_collection(
     assert parse_qs(urlsplit(calls[0]).query) == {"_limit": ["1"]}
 
 
-def test_artifact_collections_never_paginate(monkeypatch):
-    """Artifacts must take the legacy latest-attempt path.
+def test_task_artifacts_paginate_on_service_with_latest_attempt_fix(monkeypatch):
+    """Task artifacts take the paginated path once the service can be trusted.
 
-    The paginated artifact query on service 2.6.0 selects the newest row per
-    artifact *name* rather than the artifacts of the newest task *attempt*, so
-    an artifact written only by attempt 0 can surface on a retried task. This
-    test pins the client-side guard: no _limit, no cursor, no pagination.
-
-    It deliberately does not claim to compare paginated and legacy artifact
-    results -- that divergence lives in the service's SQL and belongs to a
-    metaflow-service test, not here.
+    metaflow-service 2.6.0 paginated artifacts as the newest row per artifact
+    *name*, which could surface an artifact that the task's latest attempt never
+    wrote. 2.6.1 (metaflow-service#497) reduces to the latest attempt per task,
+    the same way the legacy listing does, so from that version on there is no
+    reason to keep artifacts on the bulk GET.
     """
     monkeypatch.setattr(
         ServiceMetadataProvider, "_version", classmethod(_paginating_version)
@@ -168,7 +171,7 @@ def test_artifact_collections_never_paginate(monkeypatch):
 
     def fake_request(cls, monitor, path, method, **kwargs):
         calls.append((path, kwargs))
-        return [{"name": "model.pkl", "ts_epoch": 1}], None
+        return [{"name": "model.pkl", "ts_epoch": 1}], {"X-Limit": "1"}
 
     monkeypatch.setattr(ServiceMetadataProvider, "_request", classmethod(fake_request))
 
@@ -181,8 +184,63 @@ def test_artifact_collections_never_paginate(monkeypatch):
     assert [record["name"] for record in records] == ["model.pkl"]
     assert len(calls) == 1
     path, options = calls[0]
+    assert path.startswith("/flows/ExampleFlow/runs/12/steps/start/tasks/1/artifacts?")
+    assert "_limit" in parse_qs(urlsplit(path).query)
+    assert options == {"return_headers": True}
+
+
+def test_service_without_artifact_fix_keeps_legacy_listing(monkeypatch):
+    """A 2.6.0 service is below the gate, so nothing is paginated against it.
+
+    The client cannot tell a 2.6.0 that paginates artifacts wrongly from one
+    that does not, so the whole paginated path waits for 2.6.1 rather than
+    paginating runs while special-casing artifacts.
+    """
+    _use_service_version(monkeypatch, "2.6.0")
+    calls = []
+
+    def fake_request(cls, monitor, path, method, **kwargs):
+        calls.append((path, kwargs))
+        return [{"name": "model.pkl", "ts_epoch": 1}], None
+
+    monkeypatch.setattr(ServiceMetadataProvider, "_request", classmethod(fake_request))
+
+    assert ServiceMetadataProvider._service_supports_cursor_pagination() is False
+
+    list(
+        ServiceMetadataProvider.iter_objects(
+            "task", "artifact", None, None, "ExampleFlow", "12", "start", "1"
+        )
+    )
+
+    assert len(calls) == 1
+    path, options = calls[0]
     assert path == "/flows/ExampleFlow/runs/12/steps/start/tasks/1/artifacts"
-    assert "?" not in path
+    assert options == {}
+
+
+def test_attempt_scoped_artifacts_never_paginate(monkeypatch):
+    """The per-attempt artifact endpoint has no cursor pagination; keep the bulk GET."""
+    monkeypatch.setattr(
+        ServiceMetadataProvider, "_version", classmethod(_paginating_version)
+    )
+    calls = []
+
+    def fake_request(cls, monitor, path, method, **kwargs):
+        calls.append((path, kwargs))
+        return [{"name": "model.pkl", "ts_epoch": 1}], None
+
+    monkeypatch.setattr(ServiceMetadataProvider, "_request", classmethod(fake_request))
+
+    list(
+        ServiceMetadataProvider.iter_objects(
+            "task", "artifact", None, 0, "ExampleFlow", "12", "start", "1"
+        )
+    )
+
+    assert len(calls) == 1
+    path, options = calls[0]
+    assert path == "/flows/ExampleFlow/runs/12/steps/start/tasks/1/attempt/0/artifacts"
     assert options == {}
 
 
@@ -252,7 +310,10 @@ def test_service_switch_rechecks_pagination_capability(monkeypatch):
     A single cached boolean made a 2.6 service inherit a 2.5 verdict (and vice
     versa), disabling supported filtering or paginating an older endpoint.
     """
-    versions = {"http://old-service": "2.5.0", "http://new-service": "2.6.0"}
+    versions = {
+        "http://old-service": "2.5.0",
+        "http://new-service": PAGINATING_SERVICE_VERSION,
+    }
     monkeypatch.setattr(
         ServiceMetadataProvider,
         "_version",
@@ -275,7 +336,7 @@ def test_capability_checks_share_one_version_ping_per_service(monkeypatch):
 
     def counting_version(cls, monitor):
         pings.append(cls.INFO)
-        return "2.6.0"
+        return PAGINATING_SERVICE_VERSION
 
     monkeypatch.setattr(
         ServiceMetadataProvider, "_version", classmethod(counting_version)
