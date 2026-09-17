@@ -2414,8 +2414,11 @@ class Run(MetaflowObject):
         Steps and their tasks are scanned in iteration order, which is
         newest-created first (see `MetaflowObject.__iter__`), so the first
         match is the latest failed task; for a failed run this is typically
-        the task that caused the failure. Returns None when every task in
-        the run is successful.
+        the task that caused the failure. A task counts as failed once it has
+        finished without success: either it raised (its `exception` is set)
+        or a decorator such as `@catch` handled the failure. Tasks that are
+        still running, or that never started, are skipped. Returns None when
+        no task in the run has failed.
 
         Together with `Flow.failed_runs` and `Task.failure_summary` this lets
         you investigate failures through the regular client:
@@ -2431,11 +2434,19 @@ class Run(MetaflowObject):
         Returns
         -------
         Task, optional
-            The latest unsuccessful task, or None if the run has none.
+            The latest failed task, or None if no task in the run has failed.
         """
         for step in self:
             for task in step:
-                if not task.successful:
+                if task.successful:
+                    continue
+                # `finished` reads `_task_ok`, which the task runner sets to
+                # False when the step raises, so on its own it cannot tell a
+                # crashed task from one that is still running. A crashed task
+                # has recorded its exception; a task whose failure a decorator
+                # handled (e.g. @catch) is finished but not successful. A task
+                # that has not written its artifacts yet is neither.
+                if task.exception is not None or task.finished:
                     return task
         return None
 
@@ -2781,7 +2792,7 @@ class Flow(MetaflowObject):
 
     def failed_runs(
         self,
-        *,
+        *tags: str,
         since: Optional[int] = None,
         max_runs: Optional[int] = None,
     ) -> Iterator[Run]:
@@ -2792,10 +2803,13 @@ class Flow(MetaflowObject):
         service's ``status:eq`` = ``failed`` filter server-side. Because it
         relies on server-side filtering, it requires a metadata service with
         pagination and filtering support; against the local metadata provider
-        or an older service it raises, exactly like ``runs(filters=...)``.
+        or an older service it raises, exactly like ``runs(_filters=...)``.
 
         Parameters
         ----------
+        tags : str
+            Tags to match, exactly as for `runs`. If multiple tags are
+            specified, only failed runs that have all of them are returned.
         since : int, optional
             Inclusive lower bound on run start time as epoch milliseconds
             (``ts_epoch``). Only runs at or after this time are returned.
@@ -2810,7 +2824,7 @@ class Flow(MetaflowObject):
         filters = {"status:eq": "failed"}
         if since is not None:
             filters["ts_epoch:ge"] = int(since)
-        return self.runs(filters=filters, max_runs=max_runs)
+        return self.runs(*tags, _filters=filters, max_runs=max_runs)
 
     def __iter__(self) -> Iterator[Task]:
         """
